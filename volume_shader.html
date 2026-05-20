@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shader de la Luna</title>
+    <style>
+        body { 
+            margin: 0; 
+            overflow: hidden; 
+            background: #000; 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            cursor: grab;
+        }
+        body:active {
+            cursor: grabbing;
+        }
+        canvas { 
+            display: block; 
+            width: 100vw; 
+            height: 100vh; 
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: rgba(255, 255, 255, 0.8);
+            pointer-events: none;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 15px;
+            border-radius: 8px;
+            backdrop-filter: blur(5px);
+            user-select: none;
+        }
+        h1 { margin: 0 0 10px 0; font-size: 24px; color: #fff;}
+        p { margin: 0; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h1>Shader: Superficie Lunar</h1>
+        <p>Renderizado usando Raymarching SDF (Funciones de Distancia).</p>
+        <p> FPS Estimados: <span id="fps">Calculando...</span></p>
+        <p style="margin-top: 10px; color: #4fa; font-weight: bold;">[ Haz clic y arrastra para explorar la luna ]</p>
+    </div>
+    <canvas id="glcanvas"></canvas>
+
+<script>
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl');
+    const fpsElement = document.getElementById('fps');
+
+    if (!gl) {
+        alert('WebGL no está soportado en tu navegador');
+        throw new Error('WebGL not supported');
+    }
+
+    const vsSource = `
+        attribute vec4 aVertexPosition;
+        void main() {
+            gl_Position = aVertexPosition;
+        }
+    `;
+
+    const fsSource = `
+        precision highp float;
+        uniform vec2 u_resolution;
+        uniform float u_time;
+        uniform vec2 u_mouse;
+
+        mat2 rot(float a) {
+            float s = sin(a), c = cos(a);
+            return mat2(c, -s, s, c);
+        }
+
+        // Ruido matemático avanzado
+        float hash(float n) { return fract(sin(n) * 1e4); }
+        float hash(vec2 p) { return fract(1e4 * sin(17.0 * p.x + p.y * 0.1) * (0.1 + abs(sin(p.y * 13.0 + p.x)))); }
+        float noise(vec3 x) {
+            const vec3 step = vec3(110, 241, 171);
+            vec3 i = floor(x);
+            vec3 f = fract(x);
+            float n = dot(i, step);
+            vec3 u = f * f * (3.0 - 2.0 * f);
+            return mix(mix(mix( hash(n + dot(step, vec3(0, 0, 0))), hash(n + dot(step, vec3(1, 0, 0))), u.x),
+                           mix( hash(n + dot(step, vec3(0, 1, 0))), hash(n + dot(step, vec3(1, 1, 0))), u.x), u.y),
+                       mix(mix( hash(n + dot(step, vec3(0, 0, 1))), hash(n + dot(step, vec3(1, 0, 1))), u.x),
+                           mix( hash(n + dot(step, vec3(0, 1, 1))), hash(n + dot(step, vec3(1, 1, 1))), u.x), u.y), u.z);
+        }
+
+        // FBM (Fractal Brownian Motion) para terrenos altamente detallados
+        float fbm(vec3 p) {
+            float f = 0.0;
+            float w = 0.5;
+            for (int i = 0; i < 7; i++) { // 7 iteraciones = ultra detalle
+                f += w * noise(p);
+                p *= 2.2;
+                w *= 0.5;
+            }
+            return f;
+        }
+        
+        // Simular cráteres lunares usando una variante del ruido
+        float craterNoise(vec3 p) {
+            float n = fbm(p * 2.0);
+            return pow(abs(n * 2.0 - 1.0), 1.5); // Bordes afilados y fondos planos
+        }
+
+        // Función SDF (Signed Distance Field) que define la geometría del mundo
+        float map(vec3 p) {
+            float d = length(p) - 1.5; // Base: Esfera perfecta
+            
+            // Sumar montañas y crestas
+            float mountains = fbm(p * 2.5) * 0.25;
+            float microDetail = fbm(p * 15.0) * 0.02; // Polvo lunar y texturas rugosas
+            
+            // Restar cráteres grandes y pequeños
+            float cratersBig = craterNoise(p * 1.5) * 0.2;
+            float cratersSmall = craterNoise(p * 4.0) * 0.05;
+            
+            d -= mountains;
+            d -= microDetail;
+            d += cratersBig;   // Hundir los cráteres en la superficie
+            d += cratersSmall; // Hundir cráteres pequeños
+            
+            return d * 0.6; // Multiplicador para evitar fallos de render en superficies rugosas
+        }
+
+        // Calcular normales (dirección de la superficie para calcular luz)
+        vec3 calcNormal(vec3 p) {
+            vec2 e = vec2(0.005, 0.0);
+            return normalize(vec3(
+                map(p + e.xyy) - map(p - e.xyy),
+                map(p + e.yxy) - map(p - e.yxy),
+                map(p + e.yyx) - map(p - e.yyx)
+            ));
+        }
+
+        void main() {
+            vec2 uv = gl_FragCoord.xy / u_resolution.xy;
+            uv = uv * 2.0 - 1.0;
+            uv.x *= u_resolution.x / u_resolution.y;
+
+            // Cámara
+            vec3 ro = vec3(0.0, 0.0, -3.8); // Nos alejamos un poco más para ver la esfera
+            ro.yz *= rot(-u_mouse.x);
+            ro.xz *= rot(-u_mouse.y);
+
+            vec3 ta = vec3(0.0, 0.0, 0.0);
+            vec3 cw = normalize(ta - ro);
+            vec3 cu = normalize(cross(cw, vec3(0.0, 1.0, 0.0)));
+            vec3 cv = cross(cu, cw);
+            vec3 rd = normalize(uv.x * cu + uv.y * cv + 1.2 * cw);
+
+            // Trazado de Rayos para Superficies Sólidas
+            float t = 0.0;
+            float max_t = 10.0;
+            vec3 p;
+            bool hit = false;
+            
+            for(int i = 0; i < 150; i++) { // Más pasos para superficies complejas
+                p = ro + rd * t;
+                float d = map(p);
+                if(d < 0.002) {
+                    hit = true;
+                    break;
+                }
+                if(t > max_t) break;
+                t += d;
+            }
+
+            // Fondo del espacio profundo con sutil brillo estelar
+            vec3 bg = vec3(0.01, 0.01, 0.02) * (1.0 - length(uv) * 0.4);
+            vec3 col = bg;
+
+            if(hit) {
+                // ILUMINACIÓN REALISTA DE LA LUNA
+                vec3 n = calcNormal(p);
+                
+                // La luz rota lentamente con el tiempo simulando el sol
+                vec3 lightDir = normalize(vec3(cos(u_time * 0.2), 0.5, sin(u_time * 0.2)));
+                
+                // Luz difusa (Lambert)
+                float diff = max(dot(n, lightDir), 0.0);
+                
+                // Sombra suave (Raymarching secundario hacia el sol)
+                float shadow = 1.0;
+                float sh_t = 0.05; // Empezar un poco lejos de la superficie para evitar "acné de sombra"
+                for(int i = 0; i < 30; i++) {
+                    float h = map(p + lightDir * sh_t);
+                    if(h < 0.001) { shadow = 0.05; break; } // Está en la sombra
+                    shadow = min(shadow, 6.0 * h / sh_t);
+                    sh_t += h;
+                    if(sh_t > 2.5) break;
+                }
+                diff *= shadow;
+
+                // Color de la superficie lunar (escala de grises)
+                float materialNoise = fbm(p * 6.0);
+                // Las zonas altas son más claras, los cráteres más oscuros
+                vec3 albedo = mix(vec3(0.3, 0.3, 0.32), vec3(0.7, 0.7, 0.7), materialNoise);
+                
+                float amb = 0.02; // Poca luz ambiental (en el espacio no hay atmósfera)
+                
+                col = albedo * (diff + amb);
+            }
+
+            // Corrección gamma
+            gl_FragColor = vec4(pow(col, vec3(1.0/2.2)), 1.0);
+        }
+    `;
+
+    function createShader(gl, type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+            console.error('Error:', gl.getShaderInfoLog(shader));
+            gl.deleteShader(shader);
+            return null;
+        }
+        return shader;
+    }
+
+    const vertexShader = createShader(gl, gl.VERTEX_SHADER, vsSource);
+    const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+
+    const shaderProgram = gl.createProgram();
+    gl.attachShader(shaderProgram, vertexShader);
+    gl.attachShader(shaderProgram, fragmentShader);
+    gl.linkProgram(shaderProgram);
+
+    const positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    const positions = [ -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0 ];
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
+
+    const positionAttributeLocation = gl.getAttribLocation(shaderProgram, "aVertexPosition");
+    const resolutionUniformLocation = gl.getUniformLocation(shaderProgram, "u_resolution");
+    const timeUniformLocation = gl.getUniformLocation(shaderProgram, "u_time");
+    const mouseUniformLocation = gl.getUniformLocation(shaderProgram, "u_mouse");
+
+    let rotX = 0;
+    let rotY = 0;
+    let isDragging = false;
+    let lastMousePos = { x: 0, y: 0 };
+
+    window.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        lastMousePos = { x: e.clientX, y: e.clientY };
+    });
+
+    window.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        const deltaX = e.clientX - lastMousePos.x;
+        const deltaY = e.clientY - lastMousePos.y;
+        
+        rotY += deltaX * 0.005;
+        rotX += deltaY * 0.005;
+        rotX = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, rotX));
+        lastMousePos = { x: e.clientX, y: e.clientY };
+    });
+
+    window.addEventListener('mouseup', () => { isDragging = false; });
+    window.addEventListener('mouseleave', () => { isDragging = false; });
+    
+    window.addEventListener('touchstart', (e) => {
+        isDragging = true;
+        lastMousePos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }, {passive: true});
+
+    window.addEventListener('touchmove', (e) => {
+        if (!isDragging) return;
+        const deltaX = e.touches[0].clientX - lastMousePos.x;
+        const deltaY = e.touches[0].clientY - lastMousePos.y;
+        rotY += deltaX * 0.005;
+        rotX += deltaY * 0.005;
+        rotX = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, rotX));
+        lastMousePos = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }, {passive: true});
+
+    window.addEventListener('touchend', () => { isDragging = false; });
+
+    let lastTime = 0;
+    let frames = 0;
+
+    function render(time) {
+        frames++;
+        if (time - lastTime >= 1000) {
+            fpsElement.innerText = frames;
+            frames = 0;
+            lastTime = time;
+        }
+
+        const seconds = time * 0.001; 
+
+        if (canvas.width !== window.innerWidth || canvas.height !== window.innerHeight) {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+        }
+
+        gl.useProgram(shaderProgram);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+        gl.enableVertexAttribArray(positionAttributeLocation);
+        gl.vertexAttribPointer(positionAttributeLocation, 2, gl.FLOAT, false, 0, 0);
+
+        gl.uniform2f(resolutionUniformLocation, gl.canvas.width, gl.canvas.height);
+        gl.uniform1f(timeUniformLocation, seconds);
+        gl.uniform2f(mouseUniformLocation, rotX, rotY);
+
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+</script>
+</body>
+</html>
